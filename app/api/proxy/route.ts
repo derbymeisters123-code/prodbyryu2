@@ -1,132 +1,48 @@
+import { NextRequest, NextResponse } from 'next/server';
+
 export const runtime = 'edge';
 
-import type { NextRequest } from "next/server"
+export async function GET(request: NextRequest) {
+  const { searchParams } = new URL(request.url);
+  const encryptedQuery = searchParams.get('q');
 
-export const dynamic = "force-dynamic"
+  // 1. Verify the Secret Key header to protect your endpoint
+  const authHeader = request.headers.get('x-proxy-secret');
+  const serverSecret = process.env.PROXY_SECRET_KEY;
 
-// A real server-side fetch proxy. This bypasses browser CORS restrictions by
-// fetching the target page on the server and returning the (rewritten) HTML so
-// it can be rendered without a "plain" cross-origin iframe.
-export async function GET(req: NextRequest) {
-  const target = req.nextUrl.searchParams.get("url")
-
-  if (!target) {
-    return Response.json({ ok: false, error: "Missing url parameter." }, { status: 400 })
+  if (!authHeader || authHeader !== serverSecret) {
+    return new NextResponse('Unauthorized access to proxy', { status: 401 });
   }
 
-  let parsed: URL
-  try {
-    parsed = new URL(target)
-  } catch {
-    return Response.json({ ok: false, error: "Invalid URL." }, { status: 400 })
-  }
-
-  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
-    return Response.json({ ok: false, error: "Only http and https are supported." }, { status: 400 })
+  if (!encryptedQuery) {
+    return NextResponse.json({ error: 'Query parameter "q" is required' }, { status: 400 });
   }
 
   try {
-    const controller = new AbortController()
-    const timeout = setTimeout(() => controller.abort(), 12_000)
+    // 2. Decode the Base64 search query back to plain text
+    const decodedQuery = Buffer.from(encryptedQuery, 'base64').toString('utf-8');
 
-    const upstream = await fetch(parsed.toString(), {
-      signal: controller.signal,
-      redirect: "follow",
+    // 3. Forward the request securely to DuckDuckGo
+    const ddgUrl = `https://html.duckduckgo.com/html/?q=${encodeURIComponent(decodedQuery)}`;
+    
+    const response = await fetch(ddgUrl, {
       headers: {
-        // Present as a normal browser so we get the desktop page.
-        "User-Agent":
-          "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
-        Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.9",
-      },
-    }).finally(() => clearTimeout(timeout))
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+      }
+    });
 
-    const contentType = upstream.headers.get("content-type") || ""
-    const finalUrl = upstream.url || parsed.toString()
-
-    if (!contentType.includes("text/html")) {
-      return Response.json({
-        ok: false,
-        blocked: false,
-        reason: "non-html",
-        contentType,
-        finalUrl,
-        status: upstream.status,
-      })
+    if (!response.ok) {
+      return NextResponse.json({ error: 'Failed to fetch from DuckDuckGo' }, { status: response.status });
     }
 
-    let html = await upstream.text()
-    html = rewriteHtml(html, finalUrl)
-
-    return Response.json({
-      ok: true,
-      html,
-      finalUrl,
-      title: extractTitle(html),
-      status: upstream.status,
-    })
-  } catch (err) {
-    const message = err instanceof Error ? err.message : "Unknown error"
-    const aborted = message.toLowerCase().includes("abort")
-    return Response.json({
-      ok: false,
-      blocked: true,
-      reason: aborted ? "timeout" : "fetch-failed",
-      message,
-    })
+    const html = await response.text();
+    return new NextResponse(html, {
+      headers: {
+        'Content-Type': 'text/html; charset=utf-8',
+        'Access-Control-Allow-Origin': '*',
+      },
+    });
+  } catch (error) {
+    return NextResponse.json({ error: 'Internal Server Error' }, { status: 500 });
   }
-}
-
-function extractTitle(html: string): string {
-  const match = html.match(/<title[^>]*>([\s\S]*?)<\/title>/i)
-  return match ? match[1].trim().replace(/\s+/g, " ") : ""
-}
-
-function rewriteHtml(html: string, baseUrl: string): string {
-  // Strip frame-busting / CSP meta tags that would block rendering inside srcdoc.
-  let out = html.replace(
-    /<meta[^>]+http-equiv=["']?(content-security-policy|x-frame-options|refresh)["']?[^>]*>/gi,
-    "",
-  )
-
-  // Remove existing <base> tags then inject our own so relative assets resolve.
-  out = out.replace(/<base[^>]*>/gi, "")
-
-  const injection = `
-<base href="${escapeAttr(baseUrl)}">
-<style>
-  ::-webkit-scrollbar{width:10px;height:10px}
-  ::-webkit-scrollbar-track{background:transparent}
-  ::-webkit-scrollbar-thumb{background:#3f3f46;border-radius:8px}
-</style>
-<script>
-(function(){
-  // Intercept navigation so it flows back through the parent browser shell.
-  document.addEventListener('click', function(e){
-    var a = e.target && e.target.closest ? e.target.closest('a[href]') : null;
-    if(!a) return;
-    var href = a.getAttribute('href');
-    if(!href || href.startsWith('javascript:') || href.startsWith('#') || href.startsWith('mailto:')) return;
-    try {
-      var abs = new URL(href, document.baseURI).href;
-      e.preventDefault();
-      parent.postMessage({ type: 'ryu-navigate', url: abs }, '*');
-    } catch(_){}
-  }, true);
-  // Block in-page form submissions from breaking out of the sandbox.
-  document.addEventListener('submit', function(e){ e.preventDefault(); }, true);
-})();
-</script>`
-
-  if (/<head[^>]*>/i.test(out)) {
-    out = out.replace(/<head[^>]*>/i, (m) => m + injection)
-  } else {
-    out = injection + out
-  }
-
-  return out
-}
-
-function escapeAttr(value: string): string {
-  return value.replace(/"/g, "&quot;")
 }
